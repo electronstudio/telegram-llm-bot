@@ -315,6 +315,39 @@ func handleChatMember(bot *telebot.Bot, status *BotStatus, update *telebot.ChatM
 	}
 }
 
+func handleFrankCommand(bot *telebot.Bot, status *BotStatus, m *telebot.Message) {
+	command := strings.ToUpper(strings.TrimSpace(m.Text))
+	chatID := m.Chat.ID
+
+	log.Printf("Received FRANK command: '%s' from chat %d", command, chatID)
+
+	switch command {
+	case "FRANK STOP":
+		err := status.removeChatID(chatID)
+		if err != nil {
+			log.Printf("Failed to remove chat ID %d: %v", chatID, err)
+			bot.Send(m.Chat, "❌ Failed to remove chat from tracking")
+		} else {
+			log.Printf("Chat %d removed from tracking via FRANK STOP command", chatID)
+			bot.Send(m.Chat, "✅ Chat removed from tracking - bot will no longer send startup notifications here")
+		}
+
+	case "FRANK START":
+		err := status.addChatID(chatID)
+		if err != nil {
+			log.Printf("Failed to add chat ID %d: %v", chatID, err)
+			bot.Send(m.Chat, "❌ Failed to add chat to tracking")
+		} else {
+			log.Printf("Chat %d added to tracking via FRANK START command", chatID)
+			bot.Send(m.Chat, "✅ Chat added to tracking - bot will send startup notifications here")
+		}
+
+	default:
+		log.Printf("Unknown FRANK command: '%s'", command)
+		bot.Send(m.Chat, "❓ Unknown command. Available commands:\n• FRANK STOP - Remove chat from tracking\n• FRANK START - Add chat to tracking")
+	}
+}
+
 func handleIncomingMessage(bot *telebot.Bot, context *ConversationContext, config Config, status *BotStatus, m *telebot.Message) {
 	if m.Text == "" || strings.TrimSpace(m.Text) == "" {
 		return
@@ -324,12 +357,29 @@ func handleIncomingMessage(bot *telebot.Bot, context *ConversationContext, confi
 		return
 	}
 
-	err := status.addChatID(m.Chat.ID)
-	if err != nil {
-		log.Printf("Failed to add chat ID %d from message: %v", m.Chat.ID, err)
-	} else {
-		log.Printf("Tracking chat %d (%s)", m.Chat.ID, m.Chat.Title)
+	// Check for FRANK commands
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(m.Text)), "FRANK ") {
+		handleFrankCommand(bot, status, m)
+		return
 	}
+
+	// Check if this chat is in our tracking list
+	status.mutex.Lock()
+	isTracked := false
+	for _, id := range status.ChatIDs {
+		if id == m.Chat.ID {
+			isTracked = true
+			break
+		}
+	}
+	status.mutex.Unlock()
+
+	if !isTracked {
+		log.Printf("Ignoring message from untracked chat %d (%s)", m.Chat.ID, m.Chat.Title)
+		return
+	}
+
+	log.Printf("Processing message from tracked chat %d (%s)", m.Chat.ID, m.Chat.Title)
 
 	context.Mutex.Lock()
 	defer context.Mutex.Unlock()
@@ -424,11 +474,17 @@ guitars,
 Nintendo,
 the band Bloc Party.
 
+However he only occasionally brings them up.  Usually he wait for someone else to mention them first.  His topic of conversation is whatever the others are talking about.
+
 Following this message are the messages containing the most recent lines in the script.  The format of each message is:
 [character name]: [paragraph of speech]
 
 The format of your response is:
-[paragraph of speech in character as Frank]`,
+[INTEREST] [paragraph of speech in character as Frank]
+
+INTEREST is either "HIGH", "LOW" or "MEDIUM" depending on how interesting Frank finds the previous text. Frank's INTEREST is always HIGH when the name Frank is mentioned.
+
+Do not prefix your responses with 'frank:'`,
 		PendingMessages: []Message{},
 		Timer:           nil,
 	}
