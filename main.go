@@ -54,7 +54,7 @@ type OpenAIResponse struct {
 
 func loadConfig() (Config, error) {
 	var config Config
-	
+
 	file, err := os.Open("config.json")
 	if err != nil {
 		return config, fmt.Errorf("failed to open config.json: %v", err)
@@ -85,14 +85,14 @@ func loadConfig() (Config, error) {
 
 func callOpenAI(config Config, messages []OpenAIMessage) (string, error) {
 	client := resty.New()
-	
+
 	request := OpenAIRequest{
 		Model:    config.OpenAIModel,
 		Messages: messages,
 	}
 
 	var response OpenAIResponse
-	
+
 	resp, err := client.R().
 		SetHeader("Authorization", "Bearer "+config.OpenAIAPIKey).
 		SetHeader("Content-Type", "application/json").
@@ -117,7 +117,7 @@ func callOpenAI(config Config, messages []OpenAIMessage) (string, error) {
 
 func formatMessagesForContext(context *ConversationContext) []OpenAIMessage {
 	var openAIMessages []OpenAIMessage
-	
+
 	openAIMessages = append(openAIMessages, OpenAIMessage{
 		Role:    "system",
 		Content: context.SystemMessage,
@@ -150,7 +150,7 @@ func formatMessagesForContext(context *ConversationContext) []OpenAIMessage {
 func trimContext(context *ConversationContext, maxChars int) {
 	for {
 		totalChars := 0
-		
+
 		for _, msg := range context.Messages {
 			if msg.IsBot {
 				totalChars += len(msg.Text)
@@ -174,7 +174,7 @@ func addToContext(context *ConversationContext, username string, text string, is
 		Timestamp: time.Now(),
 		IsBot:     isBot,
 	}
-	
+
 	context.Messages = append(context.Messages, message)
 	trimContext(context, 8000)
 }
@@ -219,7 +219,7 @@ func handleIncomingMessage(bot *telebot.Bot, context *ConversationContext, confi
 
 func processBatch(bot *telebot.Bot, chat *telebot.Chat, context *ConversationContext, config Config) {
 	context.Mutex.Lock()
-	
+
 	if len(context.PendingMessages) == 0 {
 		context.Mutex.Unlock()
 		return
@@ -232,8 +232,10 @@ func processBatch(bot *telebot.Bot, chat *telebot.Chat, context *ConversationCon
 	openAIMessages := formatMessagesForContext(context)
 	context.PendingMessages = []Message{}
 	context.Timer = nil
-	
+
 	context.Mutex.Unlock()
+
+	bot.Notify(chat, telebot.Typing)
 
 	response, err := callOpenAI(config, openAIMessages)
 	if err != nil {
@@ -263,8 +265,12 @@ func main() {
 	}
 
 	context := ConversationContext{
-		Messages:        []Message{},
-		SystemMessage:   "You are a helpful assistant participating in a group chat. Be concise and friendly.",
+		Messages: []Message{},
+		SystemMessage: `You are a human man named Frank.  Your interests are WWE wrestling, 
+		guitars, Nintendo, the band Bloc Party.  You do not like transexuals.  You are participating in a group chat. 
+	Following this are the most recent messages in the group chat.  The format of each message is:
+	[username]: [message text]
+	`,
 		PendingMessages: []Message{},
 		Timer:           nil,
 	}
@@ -281,7 +287,7 @@ func main() {
 
 	bot.Handle(telebot.OnText, func(c telebot.Context) error {
 		message := c.Message()
-		
+
 		if message.Sender.ID == bot.Me.ID {
 			return nil
 		}
