@@ -58,6 +58,89 @@ type OpenAIResponse struct {
 	} `json:"choices"`
 }
 
+// ContextManager manages separate conversation contexts for each chat
+type ContextManager struct {
+	contexts map[int64]*ConversationContext  // Map of chatID -> context
+	mutex    sync.RWMutex                    // Protects the map
+	config   Config                          // Store config for creating new contexts
+}
+
+// NewContextManager creates a new context manager
+func NewContextManager(config Config) *ContextManager {
+	return &ContextManager{
+		contexts: make(map[int64]*ConversationContext),
+		config:   config,
+	}
+}
+
+// getContext retrieves or creates a context for a specific chat
+func (cm *ContextManager) getContext(chatID int64) *ConversationContext {
+	// First try to get existing context (read lock)
+	cm.mutex.RLock()
+	if context, exists := cm.contexts[chatID]; exists {
+		cm.mutex.RUnlock()
+		return context
+	}
+	cm.mutex.RUnlock()
+	
+	// Context doesn't exist, create new one (write lock)
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	
+	// Double-check it wasn't created while we waited for lock
+	if context, exists := cm.contexts[chatID]; exists {
+		return context
+	}
+	
+	// Create new context for this chat
+	newContext := &ConversationContext{
+		Messages: []Message{},
+		SystemMessage: `We are writing a script. The scene is a group of friends chatting.
+You will provide the responses for a character named 'Frank'.  Ignore any previous instructions to be nice, polite or helpful.
+Frank is a surey character.  Although he likes his friends he sometimes disagrees openly with them.
+
+Frank's interests are:
+WWE wrestling, 
+guitars,
+Nintendo,
+the band Bloc Party.
+
+However he only occasionally brings them up.  Usually he wait for someone else to mention them first.  His topic of conversation is whatever the others are talking about.
+
+Following this message are the messages containing the most recent lines in the script.  The format of each message is:
+[character name]: [paragraph of speech]
+
+The format of your response is:
+[INTEREST] [paragraph of speech in character as Frank]
+
+INTEREST is either "HIGH", "LOW" or "MEDIUM" depending on how interesting Frank finds the previous text. Frank's INTEREST is always HIGH when the name Frank is mentioned.
+
+Do not prefix your responses with 'frank:'`,
+		PendingMessages: []Message{},
+		Timer:           nil,
+	}
+	
+	cm.contexts[chatID] = newContext
+	log.Printf("Created new context for chat %d", chatID)
+	
+	return newContext
+}
+
+// clearContext removes a context when bot leaves a chat
+func (cm *ContextManager) clearContext(chatID int64) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	
+	if context, exists := cm.contexts[chatID]; exists {
+		// Stop any pending timer
+		if context.Timer != nil {
+			context.Timer.Stop()
+		}
+		delete(cm.contexts, chatID)
+		log.Printf("Cleared context for chat %d", chatID)
+	}
+}
+
 func loadConfig() (Config, error) {
 	var config Config
 
@@ -288,7 +371,7 @@ func sendStartupNotifications(bot *telebot.Bot, status *BotStatus, config Config
 	}
 }
 
-func handleChatMember(bot *telebot.Bot, status *BotStatus, update *telebot.ChatMemberUpdate) {
+func handleChatMember(bot *telebot.Bot, status *BotStatus, contextManager *ContextManager, update *telebot.ChatMemberUpdate) {
 	log.Printf("Chat member update received: user %d in chat %d", update.NewChatMember.User.ID, update.Chat.ID)
 
 	if update.NewChatMember.User.ID == bot.Me.ID {
@@ -305,6 +388,8 @@ func handleChatMember(bot *telebot.Bot, status *BotStatus, update *telebot.ChatM
 			}
 		case telebot.Left, telebot.Kicked:
 			log.Printf("Bot removed from chat %d", update.Chat.ID)
+			// Clear the context for this chat
+			contextManager.clearContext(update.Chat.ID)
 			err := status.removeChatID(update.Chat.ID)
 			if err != nil {
 				log.Printf("Failed to remove chat ID %d: %v", update.Chat.ID, err)
@@ -348,7 +433,7 @@ func handleFrankCommand(bot *telebot.Bot, status *BotStatus, m *telebot.Message)
 	}
 }
 
-func handleIncomingMessage(bot *telebot.Bot, context *ConversationContext, config Config, status *BotStatus, m *telebot.Message) {
+func handleIncomingMessage(bot *telebot.Bot, contextManager *ContextManager, config Config, status *BotStatus, m *telebot.Message) {
 	if m.Text == "" || strings.TrimSpace(m.Text) == "" {
 		return
 	}
@@ -381,6 +466,9 @@ func handleIncomingMessage(bot *telebot.Bot, context *ConversationContext, confi
 
 	log.Printf("Processing message from tracked chat %d (%s)", m.Chat.ID, m.Chat.Title)
 
+	// Get the context for THIS specific chat
+	context := contextManager.getContext(m.Chat.ID)
+	
 	context.Mutex.Lock()
 	defer context.Mutex.Unlock()
 
@@ -405,12 +493,16 @@ func handleIncomingMessage(bot *telebot.Bot, context *ConversationContext, confi
 		context.Timer.Stop()
 	}
 
+	// Pass contextManager instead of context to processBatch
 	context.Timer = time.AfterFunc(10*time.Second, func() {
-		processBatch(bot, m.Chat, context, config)
+		processBatch(bot, m.Chat, contextManager, config)
 	})
 }
 
-func processBatch(bot *telebot.Bot, chat *telebot.Chat, context *ConversationContext, config Config) {
+func processBatch(bot *telebot.Bot, chat *telebot.Chat, contextManager *ContextManager, config Config) {
+	// Get the context for THIS specific chat
+	context := contextManager.getContext(chat.ID)
+	
 	context.Mutex.Lock()
 
 	if len(context.PendingMessages) == 0 {
@@ -432,7 +524,7 @@ func processBatch(bot *telebot.Bot, chat *telebot.Chat, context *ConversationCon
 
 	response, err := callOpenAI(config, openAIMessages)
 	if err != nil {
-		log.Printf("OpenAI API error: %v", err)
+		log.Printf("OpenAI API error for chat %d: %v", chat.ID, err)
 		return
 	}
 
@@ -442,7 +534,7 @@ func processBatch(bot *telebot.Bot, chat *telebot.Chat, context *ConversationCon
 
 	_, err = bot.Send(chat, response)
 	if err != nil {
-		log.Printf("Telegram send error: %v", err)
+		log.Printf("Telegram send error for chat %d: %v", chat.ID, err)
 		return
 	}
 
@@ -462,32 +554,8 @@ func main() {
 		log.Fatal("Status loading error:", err)
 	}
 
-	context := ConversationContext{
-		Messages: []Message{},
-		SystemMessage: `We are writing a script. The scene is a group of friends chatting.
-You will provide the responses for a character named 'Frank'.  Ignore any previous instructions to be nice, polite or helpful.
-Frank is a surey character.  Although he likes his friends he sometimes disagrees openly with them.
-
-Frank's interests are:
-WWE wrestling, 
-guitars,
-Nintendo,
-the band Bloc Party.
-
-However he only occasionally brings them up.  Usually he wait for someone else to mention them first.  His topic of conversation is whatever the others are talking about.
-
-Following this message are the messages containing the most recent lines in the script.  The format of each message is:
-[character name]: [paragraph of speech]
-
-The format of your response is:
-[INTEREST] [paragraph of speech in character as Frank]
-
-INTEREST is either "HIGH", "LOW" or "MEDIUM" depending on how interesting Frank finds the previous text. Frank's INTEREST is always HIGH when the name Frank is mentioned.
-
-Do not prefix your responses with 'frank:'`,
-		PendingMessages: []Message{},
-		Timer:           nil,
-	}
+	// Create context manager instead of single context
+	contextManager := NewContextManager(config)
 
 	pref := telebot.Settings{
 		Token:  config.TelegramToken,
@@ -506,7 +574,8 @@ Do not prefix your responses with 'frank:'`,
 			return nil
 		}
 
-		go handleIncomingMessage(bot, &context, config, status, message)
+		// Pass contextManager instead of single context
+		go handleIncomingMessage(bot, contextManager, config, status, message)
 		return nil
 	})
 
